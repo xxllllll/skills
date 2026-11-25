@@ -8,13 +8,14 @@
 | --- | --- | --- | --- |
 | `commit-message` | [skills/commit-message](skills/commit-message/SKILL.md) | Git 提交信息规范、拆分策略与 trailer 约定 | `commit-msg` hook、`check-log` 历史体检 |
 | `adr` | [skills/adr](skills/adr/SKILL.md) | 架构决策记录（ADR）准入、起草、修订互链与大重构拆步 | `check-adr` 只读体检与自动取号 |
+| `release-notes` | [skills/release-notes](skills/release-notes/SKILL.md) | GitHub Release 与版本更新公告写作、场景聚类、升级提示与双语约定 | `collect-changes` 素材采集、`check-release` 质检与体检 |
 
 ## 挂到 magpie
 
-在 magpie App 的 **Library** 页面添加本仓库（例如 `xxllllll/skills`），按需勾选 `skills/commit-message` 与 `skills/adr`，随后同步到各客户端：
+在 magpie App 的 **Library** 页面添加本仓库（例如 `xxllllll/skills`），按需勾选 `skills/commit-message`、`skills/adr` 与 `skills/release-notes`，随后同步到各客户端：
 
 ```sh
-magpie library skill agents adr agy,antigravity,claude,codex,cursor,pi
+magpie library skill agents release-notes agy,antigravity,claude,codex,cursor,pi
 magpie library sync
 ```
 

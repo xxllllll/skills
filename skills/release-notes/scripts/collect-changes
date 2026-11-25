@@ -1,0 +1,445 @@
+#!/usr/bin/env python3
+"""Release Notes 素材采集脚本（只读，不改仓库）。
+
+用法：
+  collect-changes [repo] [--from TAG] [--to REF] [--range A..B] [--full] [--json]
+
+说明：
+  - 未指定 --from / --range 时，自动定位 --to（默认 HEAD）之前最近一个版本标签
+    （兼容 v1.2.3、v1.2.3-rc.1、v0.2.161+167 等格式）。
+  - 自动按用户可见候选与内部工程噪音分拣，同时保留已过滤提交摘要以防误杀。
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+VERSION_TAG_RE = re.compile(
+    r"^v?(?P<major>0|[1-9]\d*)\.(?P<minor>0|[1-9]\d*)\.(?P<patch>0|[1-9]\d*)"
+    r"(?:-(?P<pre>[0-9A-Za-z.-]+))?(?:\+(?P<build>[0-9A-Za-z.-]+))?$"
+)
+CONVENTIONAL_RE = re.compile(
+    r"^(?P<type>[a-z][a-z0-9-]*)(?:\((?P<scope>[^)]*)\))?(?P<bang>!)?:\s*(?P<desc>.+)$"
+)
+BREAKING_FOOTER_RE = re.compile(r"^BREAKING[ -]CHANGE:\s*(.+)$", re.M | re.I)
+PR_REF_RE = re.compile(r"(?<!\w)#(\d+)\b")
+TICKET_REF_RE = re.compile(r"\[([A-Za-z][A-Za-z0-9]*-\d+)\]")
+REFS_TRAILER_RE = re.compile(r"^Refs:\s*(.+)$", re.M | re.I)
+SECURITY_RE = re.compile(r"\b(CVE-\d{4}-\d+|RUSTSEC-\d{4}-\d+|GHSA-[0-9a-z-]+)\b", re.I)
+RELEASE_COMMIT_RE = re.compile(r"^(?:chore\(release\):|release\s+v?\d|bump\s+version\b)", re.I)
+BOT_AUTHOR_RE = re.compile(r"\[bot\]$|^github-actions$|^dependabot$|^renovate$", re.I)
+
+SILENT_SCOPES = frozenset({
+    "release", "scripts", "script", "tests", "test", "ci", "docs", "doc",
+    "adr", "agents", "agent", "skills", "skill", "lint", "tooling", "dev",
+    "bench", "journal", "auto", "validate", "main", "repo",
+})
+VISIBLE_TYPES = {"feat": "feat", "feature": "feat", "fix": "fix", "perf": "perf"}
+INTERNAL_TYPES = frozenset({"chore", "ci", "test", "docs", "style", "refactor", "build", "revert"})
+
+
+def run_git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=check,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+
+def _num_key(token: str) -> tuple[int, int | str]:
+    return (0, int(token)) if token.isdigit() else (1, token)
+
+
+def parse_version_key(tag: str) -> tuple | None:
+    m = VERSION_TAG_RE.match(tag.strip())
+    if not m:
+        return None
+    major, minor, patch = int(m["major"]), int(m["minor"]), int(m["patch"])
+    pre = m["pre"]
+    build = m["build"]
+    # 正式版排在同号预发布版之后
+    is_stable = 1 if pre is None else 0
+    pre_key = tuple(_num_key(p) for p in pre.split(".")) if pre else ()
+    build_key = tuple(_num_key(p) for p in build.split(".")) if build else ()
+    return (major, minor, patch, is_stable, pre_key, build_key)
+
+
+def resolve_commit(repo: Path, ref: str) -> str:
+    res = run_git(repo, "rev-parse", f"{ref}^{{commit}}", check=False)
+    if res.returncode != 0:
+        raise ValueError(f"无法解析提交引用：{ref}")
+    return res.stdout.strip()
+
+
+def find_previous_tag(repo: Path, to_ref: str) -> tuple[str | None, list[str]]:
+    """查找合并在 to_ref 之前最近的语义版本标签，同时返回恰好落在 to_ref 上的标签。"""
+    to_sha = resolve_commit(repo, to_ref)
+    res = run_git(
+        repo,
+        "tag",
+        "--merged",
+        to_sha,
+        "--format=%(refname:short)%09%(*objectname)%09%(objectname)",
+        check=False,
+    )
+    if res.returncode != 0:
+        return None, []
+
+    at_head: list[tuple[tuple, str]] = []
+    earlier: list[tuple[tuple, str]] = []
+    for line in res.stdout.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        tag = parts[0]
+        key = parse_version_key(tag)
+        if key is None:
+            continue
+        commit_sha = parts[1] or parts[2]
+        if commit_sha == to_sha:
+            at_head.append((key, tag))
+        else:
+            earlier.append((key, tag))
+
+    at_head_tags = [t for _, t in sorted(at_head, reverse=True)]
+    prev_tag = max(earlier)[1] if earlier else None
+    return prev_tag, at_head_tags
+
+
+def collect_numstats(repo: Path, rev_range: str) -> dict[str, dict[str, int]]:
+    res = run_git(
+        repo,
+        "log",
+        "--no-merges",
+        "--numstat",
+        "--format=<<<COMMIT:%H>>>",
+        rev_range,
+        check=False,
+    )
+    stats: dict[str, dict[str, int]] = {}
+    current: str | None = None
+    for line in res.stdout.splitlines():
+        if line.startswith("<<<COMMIT:") and line.endswith(">>>"):
+            current = line[10:-3]
+            stats[current] = {"files": 0, "insertions": 0, "deletions": 0}
+            continue
+        if current is None or not line.strip():
+            continue
+        parts = line.split("\t")
+        if len(parts) >= 3:
+            add_s, del_s = parts[0], parts[1]
+            stats[current]["files"] += 1
+            if add_s.isdigit():
+                stats[current]["insertions"] += int(add_s)
+            if del_s.isdigit():
+                stats[current]["deletions"] += int(del_s)
+    return stats
+
+
+def extract_refs(subject: str, body: str) -> list[str]:
+    refs: list[str] = []
+    text = f"{subject}\n{body}"
+    for m in PR_REF_RE.findall(text):
+        token = f"#{m}"
+        if token not in refs:
+            refs.append(token)
+    for m in TICKET_REF_RE.findall(text):
+        if m not in refs:
+            refs.append(m)
+    for line in REFS_TRAILER_RE.findall(body):
+        for item in re.split(r"[\s,，]+", line.strip()):
+            if item and item not in refs:
+                refs.append(item)
+    return refs
+
+
+def classify_commit(commit: dict) -> tuple[str, str]:
+    """返回 (bucket, reason)。bucket 为 breaking/security/feat/fix/perf/uncategorized/filtered/release。"""
+    subject = commit["subject"]
+    body = commit["body"]
+
+    if RELEASE_COMMIT_RE.match(subject):
+        return "release", "版本推进提交"
+
+    m = CONVENTIONAL_RE.match(subject)
+    kind = m["type"] if m else ""
+    scope = (m["scope"] or "").strip().lower() if m else ""
+    bang = bool(m and m["bang"])
+    breaking_match = BREAKING_FOOTER_RE.search(body)
+    is_breaking = bang or bool(breaking_match)
+
+    if is_breaking:
+        return "breaking", "破坏性变更标记"
+
+    if kind == "security" or scope == "security" or SECURITY_RE.search(f"{subject}\n{body}"):
+        return "security", "安全漏洞/安全修复关键词"
+
+    if not m:
+        return "uncategorized", "非 Conventional 格式，需人工判断是否对用户可见"
+
+    if scope in SILENT_SCOPES:
+        return "filtered", f"内部 scope ({scope})"
+
+    if kind in VISIBLE_TYPES:
+        return VISIBLE_TYPES[kind], f"用户可见类型 ({kind})"
+
+    if kind in INTERNAL_TYPES:
+        return "filtered", f"内部工程类型 ({kind})"
+
+    return "uncategorized", f"未识别类型 ({kind})"
+
+
+def collect_repo_changes(
+    repo: Path,
+    *,
+    from_ref: str | None = None,
+    to_ref: str = "HEAD",
+    explicit_range: str | None = None,
+) -> dict:
+    if not (repo / ".git").exists():
+        top = run_git(repo, "rev-parse", "--show-toplevel", check=False)
+        if top.returncode != 0:
+            raise ValueError(f"不是有效的 Git 仓库：{repo}")
+        repo = Path(top.stdout.strip())
+
+    at_head_tags: list[str] = []
+    if explicit_range:
+        rev_range = explicit_range
+        if ".." in explicit_range:
+            left, right = explicit_range.split("..", 1)
+            from_label = left or None
+            to_label = right or "HEAD"
+        else:
+            from_label, to_label = None, explicit_range
+    else:
+        to_label = to_ref
+        if from_ref:
+            from_label = from_ref
+        else:
+            from_label, at_head_tags = find_previous_tag(repo, to_ref)
+        rev_range = f"{from_label}..{to_label}" if from_label else to_label
+
+    fmt = "%H%x1f%h%x1f%ad%x1f%an%x1f%ae%x1f%s%x1f%b%x1e"
+    res = run_git(
+        repo,
+        "log",
+        "--no-merges",
+        "--reverse",
+        "--date=short",
+        f"--format={fmt}",
+        rev_range,
+        check=False,
+    )
+    if res.returncode != 0:
+        raise ValueError(f"读取提交日志失败（{rev_range}）：{res.stderr.strip()}")
+
+    numstats = collect_numstats(repo, rev_range)
+
+    buckets: dict[str, list[dict]] = {
+        "breaking": [],
+        "security": [],
+        "feat": [],
+        "fix": [],
+        "perf": [],
+        "uncategorized": [],
+        "filtered": [],
+    }
+    ignored_release = 0
+    authors_seen: dict[str, str] = {}
+    visible_scopes: set[str] = set()
+    total_commits = 0
+
+    for raw in res.stdout.split("\x1e"):
+        raw = raw.strip("\n\r")
+        if not raw:
+            continue
+        parts = raw.split("\x1f", 6)
+        if len(parts) < 6:
+            continue
+        sha, short_sha, date, author, email, subject = parts[:6]
+        body = parts[6].strip() if len(parts) > 6 else ""
+        total_commits += 1
+
+        m = CONVENTIONAL_RE.match(subject)
+        kind = m["type"] if m else ""
+        scope = (m["scope"] or "").strip().lower() if m else ""
+        desc = m["desc"].strip() if m else subject.strip()
+        breaking_match = BREAKING_FOOTER_RE.search(body)
+
+        entry = {
+            "sha": sha,
+            "short_sha": short_sha,
+            "date": date,
+            "author": author,
+            "email": email,
+            "subject": subject,
+            "type": kind,
+            "scope": scope,
+            "desc": desc,
+            "body": body,
+            "breaking_note": breaking_match.group(1).strip() if breaking_match else "",
+            "refs": extract_refs(subject, body),
+            "stats": numstats.get(sha, {"files": 0, "insertions": 0, "deletions": 0}),
+        }
+
+        bucket, reason = classify_commit(entry)
+        entry["filter_reason"] = reason
+        if bucket == "release":
+            ignored_release += 1
+            continue
+
+        buckets[bucket].append(entry)
+        if bucket != "filtered":
+            if scope:
+                visible_scopes.add(scope)
+            if not BOT_AUTHOR_RE.search(author):
+                key = email.lower() or author.lower()
+                authors_seen.setdefault(key, author)
+
+    visible_count = sum(
+        len(buckets[k]) for k in ("breaking", "security", "feat", "fix", "perf", "uncategorized")
+    )
+    if visible_count == 0:
+        tier = "none"
+        tier_hint = "无默认可见候选，请复核已过滤提交列表，确认是否含可感知变更"
+    elif visible_count >= 5 or len(visible_scopes) >= 3 or (buckets["breaking"] and visible_count >= 3):
+        tier = "standard"
+        tier_hint = "建议标准版：一句话总览 +（按需升级提示）+ 2–6 个场景亮点 + 精炼明细"
+    else:
+        tier = "compact"
+        tier_hint = "建议精简版：一句话总览 +（按需升级提示）+ 精炼明细（不硬凑亮点）"
+
+    shortstat = ""
+    if from_label:
+        diff_res = run_git(repo, "diff", "--shortstat", f"{from_label}..{to_label}", check=False)
+        if diff_res.returncode == 0:
+            shortstat = diff_res.stdout.strip()
+
+    return {
+        "repo": repo.name,
+        "repo_path": str(repo),
+        "range": rev_range,
+        "from_tag": from_label,
+        "to_ref": to_label,
+        "to_tags": at_head_tags,
+        "diff_shortstat": shortstat,
+        "summary": {
+            "total_commits": total_commits,
+            "ignored_release_commits": ignored_release,
+            "visible_candidates": visible_count,
+            "filtered_internal": len(buckets["filtered"]),
+            "distinct_visible_scopes": sorted(visible_scopes),
+            "has_breaking": bool(buckets["breaking"]),
+            "has_security": bool(buckets["security"]),
+            "authors": sorted(authors_seen.values()),
+            "multi_author": len(authors_seen) >= 2,
+            "recommended_tier": tier,
+            "tier_hint": tier_hint,
+        },
+        "candidates": {
+            k: buckets[k] for k in ("breaking", "security", "feat", "fix", "perf", "uncategorized")
+        },
+        "filtered": buckets["filtered"],
+    }
+
+
+def render_text(data: dict, *, full: bool = False) -> str:
+    s = data["summary"]
+    lines = [
+        f"仓库：{data['repo']}  区间：{data['range']}"
+        + (f"（目标标签：{', '.join(data['to_tags'])}）" if data["to_tags"] else ""),
+    ]
+    if data["diff_shortstat"]:
+        lines.append(f"改动规模：{data['diff_shortstat']}")
+    lines.append(
+        f"统计：共 {s['total_commits']} 条非合并提交"
+        f"（可见候选 {s['visible_candidates']} / 过滤内部 {s['filtered_internal']}"
+        + (f" / 忽略版本提交 {s['ignored_release_commits']}" if s["ignored_release_commits"] else "")
+        + "）"
+    )
+    lines.append(f"档位建议：{s['recommended_tier']} —— {s['tier_hint']}")
+    if s["has_breaking"]:
+        lines.append("⚠️ 检测到破坏性变更：正文首段后必须附 `> ⚠️ **升级提示**`")
+    if s["has_security"]:
+        lines.append("🔒 检测到安全相关提交：请确认是否单列 `## 🔒 安全` 或置顶说明")
+    if s["multi_author"]:
+        lines.append(f"贡献者（{len(s['authors'])} 位）：{', '.join(s['authors'])}（开源仓可按需开启署名与致谢）")
+    else:
+        lines.append("贡献者：单人（默认省略署名与致谢）")
+
+    labels = [
+        ("breaking", "破坏性变更"),
+        ("security", "安全修复"),
+        ("feat", "新功能候选"),
+        ("perf", "性能与优化候选"),
+        ("fix", "问题修复候选"),
+        ("uncategorized", "待确认格式提交"),
+    ]
+    for key, title in labels:
+        items = data["candidates"][key]
+        if not items:
+            continue
+        lines.append(f"\n== {title} ({len(items)}) ==")
+        for item in items:
+            scope_tag = f"[{item['scope']}] " if item["scope"] else ""
+            refs_tag = f" ({', '.join(item['refs'])})" if item["refs"] else ""
+            st = item["stats"]
+            stat_tag = f" [+{st['insertions']}/-{st['deletions']}, {st['files']}f]" if st["files"] else ""
+            lines.append(f"- {item['short_sha']} {scope_tag}{item['desc']}{refs_tag}{stat_tag}")
+            if item["breaking_note"]:
+                lines.append(f"    BREAKING CHANGE: {item['breaking_note']}")
+            if full and item["body"]:
+                for bline in item["body"].splitlines()[:6]:
+                    if bline.strip():
+                        lines.append(f"    | {bline.strip()}")
+
+    filtered = data["filtered"]
+    if filtered:
+        lines.append(f"\n== 已过滤内部提交 ({len(filtered)}，请快速扫一眼防误杀) ==")
+        for item in filtered:
+            lines.append(f"- {item['short_sha']} {item['subject']}  ({item['filter_reason']})")
+
+    return "\n".join(lines)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="采集上一版 tag 到目标提交的 Release Notes 素材（只读）")
+    parser.add_argument("repo", nargs="?", default=".", help="Git 仓库路径，默认当前目录")
+    parser.add_argument("--from", dest="from_ref", help="显式指定起始 tag/ref")
+    parser.add_argument("--to", dest="to_ref", default="HEAD", help="显式指定结束 ref，默认 HEAD")
+    parser.add_argument("--range", dest="explicit_range", help="显式指定提交区间，如 v1.0.0..v1.1.0")
+    parser.add_argument("--full", action="store_true", help="展开每条候选提交的正文摘要")
+    parser.add_argument("--json", action="store_true", help="输出结构化 JSON")
+    args = parser.parse_args()
+
+    if args.explicit_range and (args.from_ref or args.to_ref != "HEAD"):
+        print("错误：--range 不能与 --from / --to 同时使用", file=sys.stderr)
+        return 2
+
+    try:
+        data = collect_repo_changes(
+            Path(args.repo).resolve(),
+            from_ref=args.from_ref,
+            to_ref=args.to_ref,
+            explicit_range=args.explicit_range,
+        )
+    except ValueError as exc:
+        print(f"✗ {exc}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+    else:
+        print(render_text(data, full=args.full))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,450 @@
+#!/usr/bin/env python3
+"""Release Notes 质检与历史体检脚本（只读，不修改文件）。
+
+用法：
+  check-release release-notes.md [--bilingual] [--strict] [--json]
+  cat notes.md | check-release - [--bilingual] [--strict] [--json]
+  check-release --repo [path|owner/name] [--limit N] [--strict] [--json]
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
+LIST_ITEM_RE = re.compile(r"^\s*[-*]\s+(.+?)\s*$")
+HR_RE = re.compile(r"^\s*---+\s*$")
+COMPARE_ONLY_RE = re.compile(
+    r"^\*{0,2}(?:Full Changelog|完整变更|变更对比)\*{0,2}\s*[:：]\s*https?://\S+/compare/\S+$",
+    re.I,
+)
+RAW_COMMIT_PREFIX_RE = re.compile(
+    r"^\s*[-*]\s+(?:feat|fix|docs|test|refactor|perf|chore|build|ci|style|revert)"
+    r"(?:\([^)]+\))?!?:\s+\S"
+)
+# 匹配括号或反引号中的 7–40 位 commit SHA（需同时含数字与十六进制字母，或处于 `([0-9a-f]{7,12})` 模式）
+PAREN_SHA_RE = re.compile(r"\(\s*`?(?P<sha>[0-9a-f]{7,40})`?\s*\)")
+INLINE_CODE_RE = re.compile(r"`[^`]*`")
+PLACEHOLDER_RE = re.compile(
+    r"(?:\b(?:TODO|TBD|FIXME|XXX)\b|<(?:[\u4e00-\u9fff]{1,8}|version|tag|module|scope|desc|summary|repo)>)",
+    re.I,
+)
+INTERNAL_JARGON_RE = re.compile(
+    r"(?:\bADR-\d{3,4}\b|chore\(release\)|测试夹具|门禁路径|单主干工作流|合流基线|merge-base)",
+    re.I,
+)
+BREAKING_MENTION_RE = re.compile(
+    r"(?:破坏性|不兼容|拒绝启动|不再支持|不再提供|迁移脚本|\bBREAKING\s+CHANGE\b|breaking\s+change)",
+    re.I,
+)
+CALLOUT_RE = re.compile(
+    r"^\s*>\s*(?:⚠️|⚠|\[!WARNING\]|\[!CAUTION\]|\*\*(?:升级提示|注意|破坏性|Upgrade Note|Breaking))",
+    re.M | re.I,
+)
+EN_SECTION_RE = re.compile(
+    r"^##\s+.*(?:Features|Fixes|Improvements|Security|Breaking|Changes|What's Changed)",
+    re.M | re.I,
+)
+# 仅匹配以安装/部署/校验/致谢为开头的节标题（允许前置 emoji/符号），避免误伤“体验升级”类亮点标题
+INSTALL_HEADING_RE = re.compile(
+    r"^[^\w\u4e00-\u9fff]*(?:安装与升级|安装说明|安装|升级指南|升级说明|升级|部署|校验和|致谢|"
+    r"Install(?:\s*&\s*Upgrade)?|Upgrade(?:\s+Guide)?|Deployment|Checksums?|Thanks)\b",
+    re.I,
+)
+# Keep a Changelog / 标准分类分组名，不应算作“场景亮点”段落
+CATEGORY_HEADING_RE = re.compile(
+    r"^[^\w\u4e00-\u9fff]*(?:新增|新功能|功能|变更|改动|优化|性能|性能与优化|修复|问题修复|"
+    r"破坏性变化|破坏性变更|弃用|移除|安全|其他变更|本版内容|本版变化|"
+    r"Added|Changed|Deprecated|Removed|Fixed|Security|Features|Fixes|Improvements|Breaking(?:\s+Changes)?)$",
+    re.I,
+)
+TAIL_MERGE_RE = re.compile(r"(?:另有\s*\d+\s*项|\d+\s+more\b.*fixes?)", re.I)
+
+
+def strip_fenced_code(text: str) -> str:
+    """移除 fenced code block，保留行号结构，避免代码块内容触发误报。"""
+    out: list[str] = []
+    in_fence = False
+    fence = ""
+    for line in text.splitlines():
+        s = line.lstrip()
+        if not in_fence and (s.startswith("```") or s.startswith("~~~")):
+            in_fence = True
+            fence = s[:3]
+            out.append("")
+            continue
+        if in_fence:
+            if s.startswith(fence):
+                in_fence = False
+            out.append("")
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
+def is_likely_sha(token: str) -> bool:
+    if len(token) < 7 or len(token) > 40:
+        return False
+    # 排除纯字母单词（如 "abcdefg"）和纯数字（如电话/时间戳）
+    has_digit = any(c.isdigit() for c in token)
+    has_hex_alpha = any("a" <= c <= "f" for c in token)
+    return has_digit and has_hex_alpha
+
+
+def primary_body_slice(cleaned: str) -> tuple[str, str | None]:
+    """若存在独立 `---` 分隔线（双语写法），拆出主语段与后半段。"""
+    lines = cleaned.splitlines()
+    for idx, line in enumerate(lines):
+        if HR_RE.match(line):
+            left = "\n".join(lines[:idx]).strip()
+            right = "\n".join(lines[idx + 1 :]).strip()
+            if left and right:
+                return left, right
+    return cleaned, None
+
+
+def inspect_release(text: str, *, name: str = "<stdin>", bilingual: bool = False) -> dict:
+    errors: list[dict] = []
+    warnings: list[dict] = []
+    hints: list[dict] = []
+
+    raw = text.strip()
+    if not raw:
+        errors.append({"code": "empty", "message": "Release 正文为空"})
+        return {"name": name, "errors": errors, "warnings": warnings, "hints": hints, "stats": {}}
+
+    cleaned = strip_fenced_code(raw)
+    lines = cleaned.splitlines()
+    non_empty = [ln.strip() for ln in lines if ln.strip()]
+
+    # 1. 仅剩 Compare 链接
+    if non_empty and all(COMPARE_ONLY_RE.match(ln) for ln in non_empty):
+        errors.append({
+            "code": "compare_only",
+            "message": "正文仅包含自动生成的 Full Changelog 链接，缺少面向用户的变更说明",
+        })
+        return {"name": name, "errors": errors, "warnings": warnings, "hints": hints, "stats": {}}
+
+    # 2. 逐行扫描：原始 commit 前缀、裸 SHA、占位符、内部工程术语
+    raw_prefix_lines: list[int] = []
+    raw_sha_lines: list[int] = []
+    placeholder_lines: list[int] = []
+    jargon_hits: list[tuple[int, str]] = []
+
+    for lineno, line in enumerate(lines, start=1):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if RAW_COMMIT_PREFIX_RE.match(line):
+            raw_prefix_lines.append(lineno)
+
+        # 跳过表格行（如 MD5/SHA256 校验和表）再检查裸 commit SHA
+        if not stripped.startswith("|"):
+            for m in PAREN_SHA_RE.finditer(line):
+                if is_likely_sha(m.group("sha")):
+                    raw_sha_lines.append(lineno)
+                    break
+
+        no_inline = INLINE_CODE_RE.sub("", line)
+        if PLACEHOLDER_RE.search(no_inline):
+            placeholder_lines.append(lineno)
+
+        jm = INTERNAL_JARGON_RE.search(no_inline)
+        if jm:
+            jargon_hits.append((lineno, jm.group(0)))
+
+    if raw_prefix_lines:
+        errors.append({
+            "code": "raw_commit_prefix",
+            "message": f"第 {', '.join(map(str, raw_prefix_lines[:5]))} 行残留原始 commit 前缀（如 feat(scope):）",
+        })
+    if raw_sha_lines:
+        errors.append({
+            "code": "raw_sha",
+            "message": f"第 {', '.join(map(str, raw_sha_lines[:5]))} 行残留裸 commit SHA，请移除开发哈希",
+        })
+    if placeholder_lines:
+        errors.append({
+            "code": "placeholder",
+            "message": f"第 {', '.join(map(str, placeholder_lines[:5]))} 行残留未替换占位符（TODO/TBD/<...>）",
+        })
+
+    # 3. 空章节检测
+    headings: list[tuple[int, int, str]] = []
+    for idx, line in enumerate(lines):
+        hm = HEADING_RE.match(line)
+        if hm:
+            headings.append((idx, len(hm.group(1)), hm.group(2)))
+
+    empty_sections: list[str] = []
+    for i, (idx, level, title) in enumerate(headings):
+        next_idx = headings[i + 1][0] if i + 1 < len(headings) else len(lines)
+        body_slice = [ln.strip() for ln in lines[idx + 1 : next_idx] if ln.strip() and not HR_RE.match(ln)]
+        if not body_slice:
+            # 若紧跟的是更低一级子标题（如 # 标题 后紧跟 ## 分组），不算空章节
+            if i + 1 < len(headings) and headings[i + 1][1] > level:
+                continue
+            empty_sections.append(title)
+
+    if empty_sections:
+        errors.append({
+            "code": "empty_section",
+            "message": f"存在空章节：{'、'.join(empty_sections[:4])}",
+        })
+
+    # 4. 划分主语段（兼容中英双语，避免条数重复计算）
+    primary, secondary = primary_body_slice(cleaned)
+    if bilingual:
+        if secondary is None:
+            errors.append({
+                "code": "bilingual_separator",
+                "message": "双语模式缺少独立一行的 `---` 分隔线",
+            })
+        elif not EN_SECTION_RE.search(secondary):
+            errors.append({
+                "code": "bilingual_english_missing",
+                "message": "双语模式后半段缺少标准英文分组标题（如 `## 🚀 Features` / `## 🐛 Fixes`）",
+            })
+
+    # 5. 检查一句话总览（跳过首行可选的一级 `#` 标题）
+    p_lines = primary.splitlines()
+    first_content = ""
+    for ln in p_lines:
+        s = ln.strip()
+        if not s:
+            continue
+        hm = HEADING_RE.match(ln)
+        if hm and len(hm.group(1)) == 1:
+            continue
+        first_content = s
+        break
+
+    if first_content.startswith(("#", "-", "*", ">")):
+        warnings.append({
+            "code": "missing_summary",
+            "message": "开头缺少「一句话总览」自然段（直接进入了标题、列表或引用块）",
+        })
+
+    # 6. 统计主语段内的标题、场景亮点与变更列表项（排除安装/校验和/致谢节）
+    highlight_count = 0
+    h2_count = 0
+    h3_count = 0
+    change_items = 0
+    max_group_items = 0
+    current_group_items = 0
+    in_meta_section = False
+
+    # 先收集主语段所有标题位置，便于判断每个 ### 节是否包含自然语言段落
+    p_headings: list[tuple[int, int, str]] = []
+    for idx, ln in enumerate(p_lines):
+        hm = HEADING_RE.match(ln)
+        if hm:
+            p_headings.append((idx, len(hm.group(1)), hm.group(2)))
+
+    for pos, (idx, lvl, title) in enumerate(p_headings):
+        if lvl == 3 and not INSTALL_HEADING_RE.search(title) and not CATEGORY_HEADING_RE.search(title):
+            end_idx = p_headings[pos + 1][0] if pos + 1 < len(p_headings) else len(p_lines)
+            sec_lines = [s.strip() for s in p_lines[idx + 1 : end_idx] if s.strip()]
+            has_prose = any(
+                not LIST_ITEM_RE.match(s) and not s.startswith(("—", "--", "|", ">"))
+                for s in sec_lines
+            )
+            if has_prose:
+                highlight_count += 1
+
+    for ln in p_lines:
+        hm = HEADING_RE.match(ln)
+        if hm:
+            lvl, title = len(hm.group(1)), hm.group(2)
+            if lvl in (2, 3):
+                if current_group_items > max_group_items:
+                    max_group_items = current_group_items
+                current_group_items = 0
+                if lvl == 2:
+                    h2_count += 1
+                    in_meta_section = bool(INSTALL_HEADING_RE.search(title))
+                else:
+                    h3_count += 1
+                    if INSTALL_HEADING_RE.search(title):
+                        in_meta_section = True
+                    elif CATEGORY_HEADING_RE.search(title):
+                        in_meta_section = False
+            continue
+        if not in_meta_section and LIST_ITEM_RE.match(ln):
+            change_items += 1
+            current_group_items += 1
+    if current_group_items > max_group_items:
+        max_group_items = current_group_items
+
+    if change_items >= 5 and h2_count == 0 and h3_count == 0:
+        warnings.append({
+            "code": "no_headings",
+            "message": f"包含 {change_items} 条列表项却没有任何 `##` / `###` 标题（若通过 `git tag -a` 发布，请检查是否漏传 `--cleanup=verbatim`）",
+        })
+
+    if jargon_hits:
+        samples = ", ".join(f"L{ln}:{w}" for ln, w in jargon_hits[:4])
+        warnings.append({
+            "code": "internal_jargon",
+            "message": f"正文疑似泄露内部工程术语（{samples}），建议改写为用户语言或删除",
+        })
+
+    if BREAKING_MENTION_RE.search(primary) and not CALLOUT_RE.search(primary):
+        warnings.append({
+            "code": "breaking_without_callout",
+            "message": "正文提及破坏性变更或迁移，但缺少置顶的 `> ⚠️ **升级提示**` 引用块",
+        })
+
+    if change_items >= 15 and highlight_count == 0:
+        warnings.append({
+            "code": "flat_long_list",
+            "message": f"变更列表达 {change_items} 条却没有 `###` 场景亮点分层，建议提炼 2–6 个亮点段帮助扫读",
+        })
+
+    if 0 < change_items <= 3 and highlight_count >= 2:
+        hints.append({
+            "code": "tiny_overstructured",
+            "message": f"仅有 {change_items} 条变更却写了 {highlight_count} 个 `###` 亮点段，建议收缩为精简版避免复读",
+        })
+
+    if max_group_items > 14 and not TAIL_MERGE_RE.search(primary):
+        hints.append({
+            "code": "tail_merge_hint",
+            "message": f"单个分组包含 {max_group_items} 条明细，可考虑合并同模块条目并将零碎小修收束为「另有 N 项…」",
+        })
+
+    return {
+        "name": name,
+        "errors": errors,
+        "warnings": warnings,
+        "hints": hints,
+        "stats": {
+            "change_items": change_items,
+            "h2_sections": h2_count,
+            "highlight_sections": highlight_count,
+            "bilingual_detected": secondary is not None,
+        },
+    }
+
+
+def resolve_github_repo(target: str) -> str:
+    if re.fullmatch(r"[\w.-]+/[\w.-]+", target) and not Path(target).exists():
+        return target
+    p = Path(target).resolve()
+    res = subprocess.run(
+        ["git", "-C", str(p), "remote", "get-url", "origin"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if res.returncode != 0:
+        raise ValueError(f"无法从 {target} 读取 Git origin 远程地址")
+    m = re.search(r"github\.com[:/]([\w.-]+/[\w.-]+?)(?:\.git)?/?$", res.stdout.strip())
+    if not m:
+        raise ValueError(f"origin 不是 GitHub 仓库地址：{res.stdout.strip()}")
+    return m.group(1)
+
+
+def fetch_github_releases(repo_slug: str, limit: int) -> list[dict]:
+    res = subprocess.run(
+        [
+            "gh",
+            "api",
+            f"repos/{repo_slug}/releases?per_page={max(1, min(limit, 100))}",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if res.returncode != 0:
+        err = res.stderr.strip() or res.stdout.strip()
+        raise RuntimeError(f"调用 gh api 获取 {repo_slug} Releases 失败：{err}")
+    data = json.loads(res.stdout)
+    return data[:limit] if isinstance(data, list) else []
+
+
+def format_report(reports: list[dict]) -> str:
+    lines: list[str] = []
+    for rep in reports:
+        errs = rep["errors"]
+        warns = rep["warnings"]
+        hints = rep["hints"]
+        badge = "✗" if errs else ("!" if warns else "✓")
+        st = rep.get("stats") or {}
+        meta = ""
+        if st:
+            meta = (
+                f"（条目 {st.get('change_items', 0)} / 亮点 {st.get('highlight_sections', 0)}"
+                + (" / 双语" if st.get("bilingual_detected") else "")
+                + "）"
+            )
+        lines.append(f"{badge} {rep['name']}{meta}  错误 {len(errs)} / 警告 {len(warns)} / 提示 {len(hints)}")
+        for item in errs:
+            lines.append(f"  [错误] {item['message']}")
+        for item in warns:
+            lines.append(f"  [警告] {item['message']}")
+        for item in hints:
+            lines.append(f"  [提示] {item['message']}")
+    return "\n".join(lines)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="发版前校验 Release Notes 草稿，或只读体检仓库历史 Releases")
+    parser.add_argument("target", nargs="?", help="Release Notes Markdown 文件路径，或传入 `-` 从标准输入读取")
+    parser.add_argument("--repo", nargs="?", const=".", help="体检 GitHub 仓库历史 Releases（传本地路径或 owner/name）")
+    parser.add_argument("--limit", type=int, default=5, help="配合 --repo 检查最近 N 条 Release，默认 5")
+    parser.add_argument("--bilingual", action="store_true", help="启用中英双语结构校验")
+    parser.add_argument("--strict", action="store_true", help="严格模式：存在警告也返回退出码 1")
+    parser.add_argument("--json", action="store_true", help="输出结构化 JSON")
+    args = parser.parse_args()
+
+    if bool(args.target) == (args.repo is not None):
+        parser.error("请指定一个草稿文件路径（或 `-`），或使用 `--repo` 体检仓库历史 Releases")
+
+    reports: list[dict] = []
+    try:
+        if args.repo is not None:
+            slug = resolve_github_repo(args.repo)
+            releases = fetch_github_releases(slug, args.limit)
+            if not releases:
+                print(f"{slug} 暂无 GitHub Releases")
+                return 0
+            for rel in releases:
+                tag = rel.get("tag_name") or rel.get("name") or "unknown"
+                reports.append(inspect_release(rel.get("body") or "", name=f"{slug} {tag}", bilingual=args.bilingual))
+        else:
+            if args.target == "-":
+                content = sys.stdin.read()
+                label = "<stdin>"
+            else:
+                p = Path(args.target)
+                if not p.is_file():
+                    print(f"✗ 文件不存在：{args.target}", file=sys.stderr)
+                    return 1
+                content = p.read_text(encoding="utf-8")
+                label = str(p)
+            reports.append(inspect_release(content, name=label, bilingual=args.bilingual))
+    except (ValueError, RuntimeError) as exc:
+        print(f"✗ {exc}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        print(json.dumps(reports if len(reports) > 1 else reports[0], ensure_ascii=False, indent=2))
+    else:
+        print(format_report(reports))
+
+    has_err = any(r["errors"] for r in reports)
+    has_warn = any(r["warnings"] for r in reports)
+    if has_err or (args.strict and has_warn):
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
